@@ -166,7 +166,7 @@ Run locally after configuring `.env`:
 streamlit run app.py
 ```
 
-For Streamlit Community Cloud, deploy `app.py` from the private GitHub repository and add these values in the app's Secrets settings:
+For Streamlit Community Cloud, deploy `app.py` from this GitHub repository and add these values in the app's Secrets settings:
 
 ```toml
 WEAVIATE_URL = "https://your-cluster.weaviate.network"
