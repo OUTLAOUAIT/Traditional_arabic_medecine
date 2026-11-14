@@ -37,3 +37,9 @@ desktop.ini
 assets/
 artifacts/
 data/
+.agents/
+.claude/
+
+# Local-only scratch and Colab copies
+test_weaviate.py
+src/weaviate_store.ipynb
