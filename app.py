@@ -108,16 +108,29 @@ def _render_sources(sources: list[dict]) -> None:
                 st.markdown(f"- {label}")
 
 
-def _render_followups(questions: list[str], key_prefix: str) -> str | None:
-    """Render up to three one-click follow-up questions."""
+def _queue_question(question: str) -> None:
+    """Button callback: runs before the rerun, so the click is known up front."""
+    st.session_state.pending_question = question
+
+
+def _render_question_buttons(questions: list[str] | tuple[str, ...], key_prefix: str) -> None:
+    """Render one-click question buttons (presets or follow-ups)."""
     for index, question in enumerate(questions[:3]):
-        if st.button(
+        st.button(
             question,
-            key=f"followup_{key_prefix}_{index}",
+            key=f"{key_prefix}_{index}",
             use_container_width=True,
-        ):
-            return question
-    return None
+            on_click=_queue_question,
+            args=(question,),
+        )
+
+
+def _render_assistant_message(message: dict) -> None:
+    linked_answer, displayed_sources = _linked_answer(
+        message["answer"], message.get("sources", [])
+    )
+    st.markdown(linked_answer, unsafe_allow_html=False)
+    _render_sources(displayed_sources)
 
 
 def main() -> None:
@@ -180,38 +193,36 @@ def main() -> None:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    preset_question = None
-    if not st.session_state.messages:
-        for index, preset in enumerate(PRESET_QUESTIONS):
-            if st.button(preset, key=f"preset_question_{index}", use_container_width=True):
-                preset_question = preset
-
-    history_placeholder = st.empty()
-    with history_placeholder.container():
-        selected_followup = None
-        for message_index, message in enumerate(st.session_state.messages):
-            with st.chat_message(message["role"]):
-                if message["role"] == "assistant":
-                    linked_answer, displayed_sources = _linked_answer(
-                        message["answer"], message.get("sources", [])
-                    )
-                    st.markdown(linked_answer, unsafe_allow_html=False)
-                    _render_sources(displayed_sources)
-                    followup = _render_followups(
-                        message.get("follow_up_questions", []), str(message_index)
-                    )
-                    if followup:
-                        selected_followup = followup
-                else:
-                    st.markdown(message["content"])
-
+    # The chat input is pinned to the bottom of the page regardless of call order,
+    # so read it first: the transcript below then knows whether a question is pending.
     typed_question = st.chat_input("اكتب سؤالك بالعربية…")
-    question = selected_followup or preset_question or typed_question
+    question = st.session_state.pop("pending_question", None) or typed_question
+
+    messages = st.session_state.messages
+    if not messages and not question:
+        _render_question_buttons(PRESET_QUESTIONS, "preset_question")
+
+    # Keep the whole conversation on screen, oldest first.
+    for message_index, message in enumerate(messages):
+        with st.chat_message(message["role"]):
+            if message["role"] == "assistant":
+                _render_assistant_message(message)
+                # Always draw this slot so it overwrites last run's buttons at once;
+                # otherwise Streamlit keeps showing them greyed out until the run ends.
+                followup_slot = st.empty()
+                # Like ChatGPT/Claude: suggestions only under the latest answer,
+                # and hidden while a new question is being answered.
+                if message_index == len(messages) - 1 and not question:
+                    with followup_slot.container():
+                        _render_question_buttons(
+                            message.get("follow_up_questions", []),
+                            f"followup_{message_index}",
+                        )
+            else:
+                st.markdown(message["content"])
+
     if not question:
         return
-
-    # Clear stale transcript elements before the blocking retrieval/generation call.
-    history_placeholder.empty()
 
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
@@ -231,22 +242,21 @@ def main() -> None:
                     model_name=os.getenv("GEMINI_MODEL_NAME", DEFAULT_GEMINI_MODEL),
                     limit=5,
                 )
-            answer = result["answer"]
-            linked_answer, displayed_sources = _linked_answer(answer, result["sources"])
-            st.markdown(linked_answer, unsafe_allow_html=False)
-            _render_sources(displayed_sources)
-            follow_up_questions = result.get("follow_up_questions", [])[:3]
-            _render_followups(follow_up_questions, str(len(st.session_state.messages)))
             st.session_state.messages.append(
                 {
                     "role": "assistant",
-                    "answer": answer,
+                    "answer": result["answer"],
                     "sources": result["sources"],
-                    "follow_up_questions": follow_up_questions,
+                    "follow_up_questions": result.get("follow_up_questions", [])[:3],
                 }
             )
         except Exception as exc:
             st.error(f"تعذّر إكمال الإجابة: {exc}")
+            return
+
+    # Redraw from session state so the new answer and its follow-up buttons
+    # render through the same transcript path as every earlier message.
+    st.rerun()
 
 
 main()
