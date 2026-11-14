@@ -147,15 +147,6 @@ python -m src.retrieval_eval
 ```
 
 
-## Generate answers with Gemini in Colab
-
-The Colab notebook can now answer questions using retrieved Weaviate chunks as its only context. It uses `gemini-3.8-flash` by default and returns source IDs with the matching fasl titles and Wikisource URLs.
-
-For Colab, add a secret named `GEMINI_API_KEY` in the notebook's Secrets panel and enable notebook access. Optionally add `GEMINI_MODEL_NAME`; it defaults to `gemini-3.8-flash`. The same variables are listed in `.env.example` for local configuration. The free API tier has quotas and separate data-use terms; do not send private material through it. The notebook does not use Google Search grounding.
-
-Run the RAG function cell after the retrieval setup, then run the example question cell. Call `answer_question("your question")` to retrieve and synthesize an answer. The answer includes inline `[S1]`-style citations; the returned `sources` list maps each citation to its title, URL, and chunk index.
-
-
 ## Run the Streamlit app
 
 The app answers questions using the existing Weaviate vectors and Gemini. Bulk ingestion stays in Colab; the app only embeds each question and loads BGE-M3 once per app process.
