@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import uuid
 from urllib.parse import quote, urlsplit
 
 import streamlit as st
@@ -125,12 +126,147 @@ def _render_question_buttons(questions: list[str] | tuple[str, ...], key_prefix:
         )
 
 
+def _mark_unanswered_as_stopped() -> None:
+    """Invalidate the running answer and close an unanswered question.
+
+    With Streamlit's fast reruns, an interrupted run keeps waiting on Gemini in
+    the background; clearing the token makes it discard its late result.
+    """
+    st.session_state.generation_token = None
+    messages = st.session_state.messages
+    if messages and messages[-1]["role"] == "user":
+        messages.append({"role": "assistant", "stopped": True})
+
+
+def _start_edit(index: int) -> None:
+    st.session_state.editing_index = index
+
+
+def _cancel_edit() -> None:
+    st.session_state.editing_index = None
+
+
+def _submit_edit(index: int) -> None:
+    """Replace the question at ``index`` and drop everything after it."""
+    text = str(st.session_state.get(f"edit_text_{index}", "")).strip()
+    if not text:
+        return
+    st.session_state.messages = st.session_state.messages[:index]
+    st.session_state.editing_index = None
+    st.session_state.pending_question = text
+
+
+def _render_user_message(message: dict, index: int, *, busy: bool) -> None:
+    if st.session_state.get("editing_index") == index:
+        with st.form(key=f"edit_form_{index}", border=False):
+            st.text_area(
+                "تعديل السؤال",
+                value=message["content"],
+                key=f"edit_text_{index}",
+                label_visibility="collapsed",
+            )
+            send_col, cancel_col = st.columns(2)
+            send_col.form_submit_button(
+                "إرسال",
+                type="primary",
+                use_container_width=True,
+                on_click=_submit_edit,
+                args=(index,),
+            )
+            cancel_col.form_submit_button(
+                "إلغاء", use_container_width=True, on_click=_cancel_edit
+            )
+        return
+
+    st.markdown(message["content"])
+    if not busy:
+        st.button(
+            "تعديل",
+            key=f"edit_button_{index}",
+            icon=":material/edit:",
+            type="tertiary",
+            on_click=_start_edit,
+            args=(index,),
+        )
+
+
 def _render_assistant_message(message: dict) -> None:
+    if message.get("stopped"):
+        st.caption("تم إيقاف الإجابة.")
+        return
+    if message.get("error"):
+        st.error(f"تعذّر إكمال الإجابة: {message['error']}")
+        return
     linked_answer, displayed_sources = _linked_answer(
         message["answer"], message.get("sources", [])
     )
     st.markdown(linked_answer, unsafe_allow_html=False)
     _render_sources(displayed_sources)
+
+
+def _render_transcript(messages: list[dict], *, busy: bool) -> None:
+    """Draw the whole conversation, oldest first."""
+    if not messages:
+        _render_question_buttons(PRESET_QUESTIONS, "preset_question")
+    for message_index, message in enumerate(messages):
+        with st.chat_message(message["role"]):
+            if message["role"] == "user":
+                _render_user_message(message, message_index, busy=busy)
+                continue
+            _render_assistant_message(message)
+            # Like ChatGPT/Claude: suggestions only under the latest answer,
+            # hidden while a question is being edited or answered.
+            editing = st.session_state.get("editing_index") is not None
+            if message_index == len(messages) - 1 and not busy and not editing:
+                _render_question_buttons(
+                    message.get("follow_up_questions", []),
+                    f"followup_{message_index}",
+                )
+
+
+def _answer_and_store(question: str, messages: list[dict]) -> None:
+    """Answer the latest question, with a Stop button while waiting."""
+    token = uuid.uuid4().hex
+    st.session_state.generation_token = token
+    with st.chat_message("assistant"):
+        st.button(
+            "إيقاف",
+            key="stop_generation",
+            icon=":material/stop_circle:",
+            type="tertiary",
+            on_click=_mark_unanswered_as_stopped,
+        )
+        try:
+            model_name = os.getenv("EMBEDDING_MODEL_NAME", DEFAULT_MODEL_NAME)
+            embedding_model = _get_embedding_model(model_name)
+            client = _get_gemini_client()
+            with st.spinner("أبحث في النص وأعدّ الإجابة…"):
+                result = answer_question(
+                    question,
+                    embedding_model=embedding_model,
+                    gemini_client=client,
+                    conversation_history=messages[:-1],
+                    model_name=os.getenv("GEMINI_MODEL_NAME", DEFAULT_GEMINI_MODEL),
+                    limit=5,
+                )
+            reply = {
+                "role": "assistant",
+                "answer": result["answer"],
+                "sources": result["sources"],
+                "follow_up_questions": result.get("follow_up_questions", [])[:3],
+            }
+        except Exception as exc:
+            reply = {"role": "assistant", "error": str(exc)}
+
+    # Stopped, edited, or superseded while waiting: drop this late result.
+    if st.session_state.get("generation_token") != token:
+        return
+    st.session_state.generation_token = None
+    st.session_state.messages.append(reply)
+
+    # Redraw from session state so the new answer and its buttons render
+    # through the same transcript path as every earlier message.
+    st.rerun()
 
 
 def main() -> None:
@@ -171,7 +307,8 @@ def main() -> None:
             unicode-bidi: isolate;
         }
 
-        [data-testid="stChatInput"] textarea {
+        [data-testid="stChatInput"] textarea,
+        [data-testid="stTextArea"] textarea {
             direction: rtl;
             text-align: right;
         }
@@ -198,65 +335,26 @@ def main() -> None:
     typed_question = st.chat_input("اكتب سؤالك بالعربية…")
     question = st.session_state.pop("pending_question", None) or typed_question
 
+    if question:
+        # A question typed while another answer was running interrupts it.
+        _mark_unanswered_as_stopped()
+        st.session_state.editing_index = None
+        st.session_state.messages.append({"role": "user", "content": question})
+
     messages = st.session_state.messages
-    if not messages and not question:
-        _render_question_buttons(PRESET_QUESTIONS, "preset_question")
-
-    # Keep the whole conversation on screen, oldest first.
-    for message_index, message in enumerate(messages):
-        with st.chat_message(message["role"]):
-            if message["role"] == "assistant":
-                _render_assistant_message(message)
-                # Always draw this slot so it overwrites last run's buttons at once;
-                # otherwise Streamlit keeps showing them greyed out until the run ends.
-                followup_slot = st.empty()
-                # Like ChatGPT/Claude: suggestions only under the latest answer,
-                # and hidden while a new question is being answered.
-                if message_index == len(messages) - 1 and not question:
-                    with followup_slot.container():
-                        _render_question_buttons(
-                            message.get("follow_up_questions", []),
-                            f"followup_{message_index}",
-                        )
-            else:
-                st.markdown(message["content"])
-
-    if not question:
-        return
-
-    st.session_state.messages.append({"role": "user", "content": question})
-    with st.chat_message("user"):
-        st.markdown(question)
-
-    with st.chat_message("assistant"):
-        try:
-            model_name = os.getenv("EMBEDDING_MODEL_NAME", DEFAULT_MODEL_NAME)
-            embedding_model = _get_embedding_model(model_name)
-            client = _get_gemini_client()
-            with st.spinner("أبحث في النص وأعدّ الإجابة…"):
-                result = answer_question(
-                    question,
-                    embedding_model=embedding_model,
-                    gemini_client=client,
-                    conversation_history=st.session_state.messages[:-1],
-                    model_name=os.getenv("GEMINI_MODEL_NAME", DEFAULT_GEMINI_MODEL),
-                    limit=5,
-                )
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "answer": result["answer"],
-                    "sources": result["sources"],
-                    "follow_up_questions": result.get("follow_up_questions", [])[:3],
-                }
-            )
-        except Exception as exc:
-            st.error(f"تعذّر إكمال الإجابة: {exc}")
-            return
-
-    # Redraw from session state so the new answer and its follow-up buttons
-    # render through the same transcript path as every earlier message.
-    st.rerun()
+    busy = bool(question)
+    # Two sibling slots: the transcript is drawn in one and the other is left
+    # empty. While answering, we switch to the "answering" slot, so the empty
+    # placeholder lands on last run's transcript and wipes it at once. (Emptying
+    # and refilling the *same* slot doesn't work: Streamlit merges both into one
+    # update and keeps the old content greyed out — follow-ups, preset buttons,
+    # the replaced answer after an edit — until the answer arrives.)
+    normal_slot = st.empty()
+    answering_slot = st.empty()
+    with (answering_slot if busy else normal_slot).container():
+        _render_transcript(messages, busy=busy)
+        if question:
+            _answer_and_store(question, messages)
 
 
 main()
