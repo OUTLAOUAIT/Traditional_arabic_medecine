@@ -1,12 +1,13 @@
 # Traditional Arabic Medicine Text Pipeline
 
-This project retrieves the Arabic Wikisource article *الطب النبوي*, splits its paragraphs into fasls and retrieval chunks, stores source records in MongoDB, and generates BGE-M3 vectors for Weaviate.
+This project retrieves the Arabic Wikisource article *الطب النبوي*, splits its paragraphs into fasls and retrieval chunks, stores source records in MongoDB, and generates BGE-M3 vectors for Weaviate. A FastAPI web app answers questions about the text with Gemini, grounded in the retrieved passages and citing them.
 
 ## Architecture
 
 - **MongoDB** stores the original fasls and generated chunks.
 - **Python and BAAI/bge-m3** generate dense embeddings. The model runs where the Python script runs (your computer or Google Colab).
 - **Weaviate Cloud** stores vectors and searchable chunk metadata/text. Local Docker Weaviate remains available for development.
+- **FastAPI + Gemini** serve the chat interface: each question is embedded with BGE-M3, matched in Weaviate, and answered by Gemini from those passages only.
 
 ## Requirements
 
@@ -131,6 +132,7 @@ python -m src.retrieval_eval
 ```text
 .
 ├── data/                    # Local corpus and references (ignored by Git)
+├── frontend/                # Web chat UI (HTML/CSS/JS, no build step)
 ├── schemas/
 │   └── data_schema.py       # Pydantic fasl schema
 ├── src/
@@ -138,6 +140,8 @@ python -m src.retrieval_eval
 │   ├── chunking.py          # Paragraph chunking and MongoDB upserts
 │   ├── weaviate_connection.py # Cloud/local Weaviate connection
 │   ├── weaviate_store.py    # BGE-M3 embeddings and Weaviate sync/search
+│   ├── rag.py               # Grounded answers with Gemini (full or streamed)
+│   ├── api.py               # FastAPI: streaming /api/ask, serves frontend/
 │   └── retrieval_eval.py    # Arabic retrieval quality review
 ├── docker-compose.yml
 ├── setup_weaviate.py
@@ -147,25 +151,40 @@ python -m src.retrieval_eval
 ```
 
 
-## Run the Streamlit app
+## Run the web app
 
-The app answers questions using the existing Weaviate vectors and Gemini. Bulk ingestion stays in Colab; the app only embeds each question and loads BGE-M3 once per app process.
+The app is a FastAPI server (`src/api.py`) plus a chat interface (`frontend/`, plain HTML/CSS/JS, no build step) served by the same process. It answers questions from the existing Weaviate vectors with Gemini: at startup it loads BGE-M3 once (to embed questions) and opens one Weaviate connection, then streams each answer as it is generated. Bulk ingestion is separate and does not run in the app.
 
-Run locally after configuring `.env`:
+Configure `.env`, then run:
 
 ```powershell
-streamlit run app.py
+uvicorn src.api:app --reload
 ```
 
-For Streamlit Community Cloud, deploy `app.py` from this GitHub repository and add these values in the app's Secrets settings:
+Open http://127.0.0.1:8000.
 
-```toml
-WEAVIATE_URL = "https://your-cluster.weaviate.network"
-WEAVIATE_API_KEY = "your-weaviate-api-key"
-WEAVIATE_COLLECTION_NAME = "TibbChunksBgeM3"
-GEMINI_API_KEY = "your-gemini-api-key"
-GEMINI_MODEL_NAME = "gemini-3.8-flash"
-EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
-```
+| Variable | Purpose |
+| --- | --- |
+| `WEAVIATE_URL`, `WEAVIATE_API_KEY` | Weaviate Cloud cluster (leave both blank for local Docker) |
+| `WEAVIATE_COLLECTION_NAME` | Weaviate collection; defaults to `TibbChunksBgeM3` |
+| `GEMINI_API_KEY` | Gemini API key (required) |
+| `GEMINI_MODEL_NAME` | Gemini model; defaults to `gemini-3.8-flash` |
+| `EMBEDDING_MODEL_NAME` | Query embedding model; defaults to `BAAI/bge-m3` |
+| `RATE_LIMIT_PER_MINUTE` | Questions allowed per client IP per minute (default `10`, `0` disables) |
+| `ALLOWED_ORIGINS` | Comma-separated origins, only if the front end is hosted on another domain |
 
-Do not commit `.streamlit/secrets.toml`. Community Cloud's documented memory ceiling is approximately 2.7 GB, so BGE-M3 inference may exceed the free app's resources; check the app logs if startup or first-question inference fails. If that happens, move query embedding to a service with more memory while keeping the Streamlit UI and existing Weaviate/Gemini flow.
+The chat interface streams answers with numbered citation links to Wikisource, shows three follow-up questions once an answer is complete, and lets users stop an answer, edit a question, and switch between conversations in a sidebar. Conversations are kept in the browser's local storage, so they are per browser and device.
+
+### API
+
+- `GET /api/health`: liveness check.
+- `GET /api/config`: preset questions.
+- `POST /api/ask` with `{"question": "...", "history": [{"role": "user" | "assistant", "content": "..."}]}` returns a `text/event-stream`. Events: `sources` (all retrieved passages, `S1`…`Sn`), repeated `delta` (answer text), then `done` (final answer, cited sources, three follow-up questions) or `error`. Closing the connection stops generation.
+
+The server is stateless: the front end sends recent turns as `history` with each question.
+
+### Deployment notes
+
+- Run a single worker: each worker loads its own copy of BGE-M3 (about 2.3 GB of memory).
+- Behind a reverse proxy, start uvicorn with `--proxy-headers --forwarded-allow-ips 127.0.0.1` so the rate limit sees real client IPs.
+- The rate limit is kept in memory, per process.

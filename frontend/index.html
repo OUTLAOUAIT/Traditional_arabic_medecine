@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>الطب النبوي | اسأل عن النص</title>
+  <meta name="description" content="اسأل عن محتوى كتاب الطب النبوي، مع إجابات موثّقة بروابط المقاطع المستخدمة.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23356b52'/%3E%3Cpath d='M9 9h6a3 3 0 0 1 3 3v12a3 3 0 0 0-3-3H9zM23 9h-2a3 3 0 0 0-3 3v12a3 3 0 0 1 3-3h2z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Amiri:wght@700&family=IBM+Plex+Sans+Arabic:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="layout">
+    <aside id="sidebar" class="sidebar" aria-label="المحادثات">
+      <div class="sidebar-head">
+        <span class="brand">الطب النبوي</span>
+        <button class="icon-btn js-toggle-sidebar" type="button" aria-label="إغلاق القائمة" title="إغلاق القائمة">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M15 4v16"/></svg>
+        </button>
+      </div>
+      <button class="new-chat-btn js-new-chat" type="button">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        محادثة جديدة
+      </button>
+      <nav id="chat-list" class="chat-list"></nav>
+      <p class="sidebar-foot">تُحفظ المحادثات في هذا المتصفح فقط.</p>
+    </aside>
+    <div id="backdrop" class="backdrop"></div>
+
+    <div class="app">
+      <header class="topbar">
+        <button class="icon-btn js-toggle-sidebar topbar-toggle" type="button" aria-label="قائمة المحادثات" title="قائمة المحادثات">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M15 4v16"/></svg>
+        </button>
+        <span id="chat-title" class="chat-title"></span>
+        <button class="ghost-btn js-new-chat" type="button" aria-label="محادثة جديدة">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          <span class="label">محادثة جديدة</span>
+        </button>
+      </header>
+
+      <main class="main">
+        <div class="column">
+          <section id="welcome" class="welcome" hidden>
+            <h1>الطب النبوي</h1>
+            <p>اسأل عن محتوى الكتاب، وستظهر الإجابة مع روابط المقاطع المستخدمة.</p>
+            <div id="presets" class="presets"></div>
+          </section>
+          <div id="transcript" class="transcript"></div>
+        </div>
+      </main>
+
+      <footer class="composer-wrap">
+        <form id="composer" class="composer">
+          <textarea id="input" rows="1" placeholder="اكتب سؤالك بالعربية…" aria-label="سؤالك" maxlength="2000"></textarea>
+          <button id="send" class="send-btn" type="submit" aria-label="إرسال" disabled></button>
+        </form>
+        <p class="disclaimer">إجابات مبنية على نص تاريخي، وليست نصيحة طبية.</p>
+      </footer>
+    </div>
+  </div>
+
+  <script src="app.js" defer></script>
+</body>
+</html>

@@ -9,3 +9,5 @@ sentence-transformers>=3.0.0,<4.0.0
 weaviate-client>=4.16.4,<5.0.0
 google-genai>=1.0.0,<3.0.0
 streamlit>=1.42.0,<2.0.0
+fastapi>=0.115.0,<1.0.0
+uvicorn[standard]>=0.30.0,<1.0.0

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from contextlib import AbstractContextManager, nullcontext
+from typing import Any, Iterator
 
 from google import genai
 from google.genai import errors, types
@@ -44,7 +45,8 @@ GROUNDING AND ATTRIBUTION
 - If the excerpts are insufficient, say so plainly.
 
 HISTORICAL AND MEDICAL CONTEXT
-- For relevant Arabic answers, frame the attribution as: "بناءً على ما أصلّته **كتب الطب النبوي كمرجع تاريخي وتوجيهي**، ...".
+- Only when "first_answer_in_conversation" is true, open a relevant Arabic answer with the attribution: "بناءً على ما أصلّته **كتب الطب النبوي كمرجع تاريخي وتوجيهي**، ...".
+- When "first_answer_in_conversation" is false, do not repeat that opening or any variant of it; answer directly.
 - Avoid the generic phrase "بحسب النص".
 - Do not present historical remedies as established modern treatments.
 - Do not give personalized diagnoses, treatment instructions, or dosages.
@@ -83,6 +85,142 @@ def _default_follow_up_questions(question: str) -> list[str]:
     ]
 
 
+_NO_MATCH_ANSWER = "لم أجد مقاطع ذات صلة كافية في المصادر المتاحة للإجابة."
+_BUSY_MESSAGE = "خدمة الإجابة مشغولة مؤقتاً على النماذج المتاحة. يرجى المحاولة بعد قليل."
+_CITATION = re.compile(r"\[(S\d+)\]")
+
+
+def _normalize_history(
+    conversation_history: list[dict[str, str]] | None,
+) -> list[dict[str, str]]:
+    """Keep the last few user/assistant turns, trimmed, in prompt format."""
+    history: list[dict[str, str]] = []
+    for message in (conversation_history or [])[-6:]:
+        role = message.get("role")
+        content = message.get("content") or message.get("answer") or ""
+        if role in {"user", "assistant"} and content.strip():
+            history.append({"role": role, "content": content.strip()[:1500]})
+    return history
+
+
+def _retrieve_sources(
+    question: str,
+    history: list[dict[str, str]],
+    *,
+    embedding_model: SentenceTransformer,
+    limit: int,
+    weaviate_client: Any | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Search Weaviate and label the matches S1..Sn for citation."""
+    # Add recent user turns to retrieval so short follow-ups retain their subject.
+    prior_questions = [item["content"] for item in history if item["role"] == "user"][-3:]
+    retrieval_query = "\n".join([*prior_questions, question.strip()])
+    matches = search_chunks(
+        retrieval_query, limit=limit, model=embedding_model, client=weaviate_client
+    )
+    sources = [
+        {
+            "id": f"S{index}",
+            "fasl_id": str(match.get("fasl_id", "")),
+            "title": str(match.get("title", "")),
+            "source_url": str(match.get("source_url", "")),
+            "chunk_index": match.get("chunk_index", "?"),
+            "excerpt": str(match.get("text", "")),
+            "distance": match.get("distance"),
+        }
+        for index, match in enumerate(matches, start=1)
+    ]
+    return sources, matches
+
+
+def _build_prompt(
+    question: str, history: list[dict[str, str]], sources: list[dict[str, Any]]
+) -> str:
+    excerpts = [
+        {"id": source["id"], "title": source["title"], "text": source["excerpt"]}
+        for source in sources
+    ]
+    # The attribution opening belongs to the first answer only; later answers
+    # in the same conversation answer directly.
+    first_answer = not any(turn["role"] == "assistant" for turn in history)
+    return json.dumps(
+        {
+            "first_answer_in_conversation": first_answer,
+            "recent_conversation": history,
+            "original_question": question.strip(),
+            "source_excerpts": excerpts,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _parse_follow_ups(payload: str, question: str) -> list[str]:
+    questions: list[str] = []
+    try:
+        decoded = json.loads(payload.strip())
+        if isinstance(decoded, list):
+            questions = [
+                item.strip() for item in decoded if isinstance(item, str) and item.strip()
+            ][:3]
+    except json.JSONDecodeError:
+        pass
+    return questions if len(questions) == 3 else _default_follow_up_questions(question)
+
+
+def _finalize(
+    raw_response: str,
+    *,
+    question: str,
+    sources: list[dict[str, Any]],
+    matches: list[dict[str, Any]],
+    model: str,
+    strict_citations: bool,
+) -> dict[str, Any]:
+    """Split the model output into answer and follow-ups, and map citations."""
+    answer, delimiter, follow_up_payload = raw_response.strip().partition(
+        FOLLOW_UP_DELIMITER
+    )
+    answer = answer.strip()
+    if not answer:
+        raise RuntimeError("Gemini returned an empty response")
+    follow_up_questions = (
+        _parse_follow_ups(follow_up_payload, question)
+        if delimiter
+        else _default_follow_up_questions(question)
+    )
+
+    known_ids = {source["id"] for source in sources}
+    unknown_ids = set(_CITATION.findall(answer)) - known_ids
+    if unknown_ids:
+        if strict_citations:
+            raise RuntimeError(f"Answer contains unknown citations: {sorted(unknown_ids)}")
+        # A streamed answer is already on screen; drop only the bad markers.
+        answer = _CITATION.sub(
+            lambda match: "" if match.group(1) in unknown_ids else match.group(0), answer
+        )
+
+    source_by_id = {source["id"]: source for source in sources}
+    used_ids = list(dict.fromkeys(_CITATION.findall(answer)))
+    return {
+        "answer": answer,
+        "follow_up_questions": follow_up_questions,
+        "sources": [source_by_id[source_id] for source_id in used_ids],
+        "retrieved_chunks": matches,
+        "model": model,
+    }
+
+
+def _models_to_try(model_name: str, fallback_model: str) -> list[str]:
+    return list(dict.fromkeys((model_name, fallback_model, FINAL_FALLBACK_GEMINI_MODEL)))
+
+
+def _validate(question: str, limit: int) -> None:
+    if not question or not question.strip():
+        raise ValueError("Question cannot be empty")
+    if limit <= 0:
+        raise ValueError("limit must be a positive integer")
+
+
 def answer_question(
     question: str,
     *,
@@ -92,121 +230,158 @@ def answer_question(
     limit: int = 5,
     model_name: str = DEFAULT_GEMINI_MODEL,
     fallback_model: str = FALLBACK_GEMINI_MODEL,
+    weaviate_client: Any | None = None,
 ) -> dict[str, Any]:
     """Retrieve relevant chunks and generate an answer grounded in those chunks."""
-    if not question or not question.strip():
-        raise ValueError("Question cannot be empty")
-    if limit <= 0:
-        raise ValueError("limit must be a positive integer")
-
-    history: list[dict[str, str]] = []
-    for message in (conversation_history or [])[-6:]:
-        role = message.get("role")
-        content = message.get("content") or message.get("answer") or ""
-        if role in {"user", "assistant"} and content.strip():
-            history.append({"role": role, "content": content.strip()[:1500]})
-
-    # Add recent user turns to retrieval so short follow-ups retain their subject.
-    prior_questions = [item["content"] for item in history if item["role"] == "user"][-3:]
-    retrieval_query = "\n".join([*prior_questions, question.strip()])
-    matches = search_chunks(retrieval_query, limit=limit, model=embedding_model)
+    _validate(question, limit)
+    history = _normalize_history(conversation_history)
+    sources, matches = _retrieve_sources(
+        question,
+        history,
+        embedding_model=embedding_model,
+        limit=limit,
+        weaviate_client=weaviate_client,
+    )
     if not matches:
         return {
-            "answer": "لم أجد مقاطع ذات صلة كافية في المصادر المتاحة للإجابة.",
+            "answer": _NO_MATCH_ANSWER,
             "follow_up_questions": _default_follow_up_questions(question),
             "sources": [],
             "retrieved_chunks": [],
             "model": None,
         }
 
-    sources: list[dict[str, Any]] = []
-    excerpts: list[dict[str, str]] = []
-    for index, match in enumerate(matches, start=1):
-        source_id = f"S{index}"
-        title = str(match.get("title", ""))
-        text = str(match.get("text", ""))
-        sources.append(
-            {
-                "id": source_id,
-                "fasl_id": str(match.get("fasl_id", "")),
-                "title": title,
-                "source_url": str(match.get("source_url", "")),
-                "chunk_index": match.get("chunk_index", "?"),
-                "excerpt": text,
-                "distance": match.get("distance"),
-            }
-        )
-        excerpts.append({"id": source_id, "title": title, "text": text})
-
-    prompt = json.dumps(
-        {
-            "recent_conversation": history,
-            "original_question": question.strip(),
-            "source_excerpts": excerpts,
-        },
-        ensure_ascii=False,
-    )
-    generation_config = types.GenerateContentConfig(
-        system_instruction=ANSWER_SYSTEM_INSTRUCTION,
-    )
-
-    actual_model = ""
-    response = None
-    models_to_try = dict.fromkeys(
-        (model_name, fallback_model, FINAL_FALLBACK_GEMINI_MODEL)
-    )
-    for candidate_model in models_to_try:
+    prompt = _build_prompt(question, history, sources)
+    config = types.GenerateContentConfig(system_instruction=ANSWER_SYSTEM_INSTRUCTION)
+    for candidate_model in _models_to_try(model_name, fallback_model):
         try:
             response = gemini_client.models.generate_content(
-                model=candidate_model,
-                contents=prompt,
-                config=generation_config,
+                model=candidate_model, contents=prompt, config=config
             )
-            actual_model = candidate_model
-            break
         except errors.ServerError as exc:
             # The SDK retries transient errors; only a 503 triggers model fallback.
             if exc.code != 503:
                 raise
-
-    if response is None:
-        raise RuntimeError(
-            "خدمة الإجابة مشغولة مؤقتاً على النماذج المتاحة. يرجى المحاولة بعد قليل."
+            continue
+        return _finalize(
+            response.text or "",
+            question=question,
+            sources=sources,
+            matches=matches,
+            model=candidate_model,
+            strict_citations=True,
         )
+    raise RuntimeError(_BUSY_MESSAGE)
 
-    raw_response = (response.text or "").strip()
-    answer, delimiter, follow_up_payload = raw_response.partition(FOLLOW_UP_DELIMITER)
-    answer = answer.strip()
-    if not answer:
-        raise RuntimeError("Gemini returned an empty response")
 
-    follow_up_questions: list[str] = []
-    if delimiter:
+def _held_back_length(text: str) -> int:
+    """Length of the longest suffix of ``text`` that could start the delimiter."""
+    for size in range(min(len(text), len(FOLLOW_UP_DELIMITER) - 1), 0, -1):
+        if FOLLOW_UP_DELIMITER.startswith(text[-size:]):
+            return size
+    return 0
+
+
+def stream_answer(
+    question: str,
+    *,
+    embedding_model: SentenceTransformer,
+    gemini_client: genai.Client,
+    conversation_history: list[dict[str, str]] | None = None,
+    limit: int = 5,
+    model_name: str = DEFAULT_GEMINI_MODEL,
+    fallback_model: str = FALLBACK_GEMINI_MODEL,
+    weaviate_client: Any | None = None,
+    retrieval_lock: AbstractContextManager[Any] | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Yield the answer as it is generated.
+
+    Events, in order:
+    - ``{"type": "sources", "sources": [...]}``: every retrieved passage, S1..Sn,
+      so citations can be linked while text is still arriving.
+    - ``{"type": "delta", "text": "..."}``: answer text, repeated. The hidden
+      follow-up section is never streamed.
+    - ``{"type": "done", ...}``: the final answer (which replaces the streamed
+      text), the cited sources only, follow-up questions, and the model used.
+
+    Closing the generator early stops reading from Gemini.
+    """
+    _validate(question, limit)
+    history = _normalize_history(conversation_history)
+    with retrieval_lock or nullcontext():
+        sources, matches = _retrieve_sources(
+            question,
+            history,
+            embedding_model=embedding_model,
+            limit=limit,
+            weaviate_client=weaviate_client,
+        )
+    yield {"type": "sources", "sources": sources}
+    if not matches:
+        yield {"type": "delta", "text": _NO_MATCH_ANSWER}
+        yield {
+            "type": "done",
+            "answer": _NO_MATCH_ANSWER,
+            "sources": [],
+            "follow_up_questions": _default_follow_up_questions(question),
+            "model": None,
+        }
+        return
+
+    prompt = _build_prompt(question, history, sources)
+    config = types.GenerateContentConfig(system_instruction=ANSWER_SYSTEM_INSTRUCTION)
+    for candidate_model in _models_to_try(model_name, fallback_model):
+        buffer = ""
+        emitted = 0
+        delimiter_found = False
+        stream = None
         try:
-            decoded_questions = json.loads(follow_up_payload.strip())
-            if isinstance(decoded_questions, list):
-                follow_up_questions = [
-                    item.strip()
-                    for item in decoded_questions
-                    if isinstance(item, str) and item.strip()
-                ][:3]
-        except json.JSONDecodeError:
-            pass
-    if len(follow_up_questions) != 3:
-        follow_up_questions = _default_follow_up_questions(question)
+            stream = gemini_client.models.generate_content_stream(
+                model=candidate_model, contents=prompt, config=config
+            )
+            for chunk in stream:
+                text = getattr(chunk, "text", None) or ""
+                if not text:
+                    continue
+                buffer += text
+                if delimiter_found:
+                    continue
+                position = buffer.find(FOLLOW_UP_DELIMITER)
+                if position != -1:
+                    delimiter_found = True
+                    safe_end = position
+                else:
+                    # Hold back a tail that might be the start of the delimiter.
+                    safe_end = len(buffer) - _held_back_length(buffer)
+                if safe_end > emitted:
+                    yield {"type": "delta", "text": buffer[emitted:safe_end]}
+                    emitted = safe_end
+        except errors.ServerError as exc:
+            # Fall back only on 503 and only before any text reached the reader.
+            if exc.code != 503 or emitted:
+                raise
+            continue
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
 
-    citation_ids = re.findall(r"\[(S\d+)\]", answer)
-    known_ids = {source["id"] for source in sources}
-    unknown_ids = set(citation_ids) - known_ids
-    if unknown_ids:
-        raise RuntimeError(f"Answer contains unknown citations: {sorted(unknown_ids)}")
-
-    source_by_id = {source["id"]: source for source in sources}
-    used_ids = list(dict.fromkeys(citation_ids))
-    return {
-        "answer": answer,
-        "follow_up_questions": follow_up_questions,
-        "sources": [source_by_id[source_id] for source_id in used_ids],
-        "retrieved_chunks": matches,
-        "model": actual_model,
-    }
+        if not delimiter_found and len(buffer) > emitted:
+            yield {"type": "delta", "text": buffer[emitted:]}
+        result = _finalize(
+            buffer,
+            question=question,
+            sources=sources,
+            matches=matches,
+            model=candidate_model,
+            strict_citations=False,
+        )
+        yield {
+            "type": "done",
+            "answer": result["answer"],
+            "sources": result["sources"],
+            "follow_up_questions": result["follow_up_questions"],
+            "model": candidate_model,
+        }
+        return
+    raise RuntimeError(_BUSY_MESSAGE)

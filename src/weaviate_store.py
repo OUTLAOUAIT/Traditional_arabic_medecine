@@ -161,12 +161,17 @@ def search_chunks(
     weaviate_collection_name: str | None = None,
     model_name: str | None = None,
     model: SentenceTransformer | None = None,
+    client: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Return nearest BGE-M3 chunks, optionally keeping only the best per fasl.
 
     By default, results contain at most one chunk per fasl so one long fasl
     cannot crowd other relevant fasls out of the result list. Set
     ``unique_fasls=False`` to retrieve several chunks from the same fasl.
+
+    Pass an open ``client`` (e.g. from a long-running API) to reuse its
+    connection; it is then not checked or closed here. Otherwise a connection
+    is opened, checked, and closed for this one search.
     """
     if not query.strip():
         raise ValueError("Search query cannot be empty")
@@ -192,43 +197,62 @@ def search_chunks(
         show_progress_bar=False,
     )[0].tolist()
 
-    with connect_weaviate() as client:
-        if not client.is_ready():
-            raise RuntimeError(
-                "Weaviate is not ready. Check the Cloud endpoint/API key or start the local service."
-            )
-        if not client.collections.exists(destination_collection_name):
-            raise RuntimeError(
-                f"Weaviate collection '{destination_collection_name}' does not exist. "
-                "Create it first with `python setup_weaviate.py`."
-            )
+    if client is not None:
+        return _nearest_chunks(
+            client, destination_collection_name, query_vector, limit, unique_fasls
+        )
 
-        collection = client.collections.get(destination_collection_name)
-        candidate_limit = (
-            min(max(limit * 10, limit), 1000) if unique_fasls else limit
+    with connect_weaviate() as own_client:
+        check_collection(own_client, destination_collection_name)
+        return _nearest_chunks(
+            own_client, destination_collection_name, query_vector, limit, unique_fasls
         )
-        response = collection.query.near_vector(
-            near_vector=query_vector,
-            target_vector=VECTOR_NAME,
-            limit=candidate_limit,
-            return_metadata=MetadataQuery(distance=True),
+
+
+def check_collection(client: Any, collection_name: str) -> None:
+    """Raise a clear error if Weaviate is down or the collection is missing."""
+    if not client.is_ready():
+        raise RuntimeError(
+            "Weaviate is not ready. Check the Cloud endpoint/API key or start the local service."
         )
-        results = []
-        seen_fasls: set[str] = set()
-        for obj in response.objects:
-            result = {
-                **obj.properties,
-                "distance": obj.metadata.distance if obj.metadata else None,
-            }
-            if unique_fasls:
-                fasl_id = str(result.get("fasl_id", ""))
-                if fasl_id in seen_fasls:
-                    continue
-                seen_fasls.add(fasl_id)
-            results.append(result)
-            if len(results) == limit:
-                break
-        return results
+    if not client.collections.exists(collection_name):
+        raise RuntimeError(
+            f"Weaviate collection '{collection_name}' does not exist. "
+            "Create it first with `python setup_weaviate.py`."
+        )
+
+
+def _nearest_chunks(
+    client: Any,
+    collection_name: str,
+    query_vector: list[float],
+    limit: int,
+    unique_fasls: bool,
+) -> list[dict[str, Any]]:
+    collection = client.collections.get(collection_name)
+    candidate_limit = min(max(limit * 10, limit), 1000) if unique_fasls else limit
+    response = collection.query.near_vector(
+        near_vector=query_vector,
+        target_vector=VECTOR_NAME,
+        limit=candidate_limit,
+        return_metadata=MetadataQuery(distance=True),
+    )
+    results = []
+    seen_fasls: set[str] = set()
+    for obj in response.objects:
+        result = {
+            **obj.properties,
+            "distance": obj.metadata.distance if obj.metadata else None,
+        }
+        if unique_fasls:
+            fasl_id = str(result.get("fasl_id", ""))
+            if fasl_id in seen_fasls:
+                continue
+            seen_fasls.add(fasl_id)
+        results.append(result)
+        if len(results) == limit:
+            break
+    return results
 
 
 if __name__ == "__main__":
